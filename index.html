@@ -1,623 +1,176 @@
-"""
-EL BRENS - Online Rock Paper Scissors (Hand Tracking)
-------------------------------------------------------
-تشغيل:   python rps_online.py
-المتطلبات: pip install opencv-python mediapipe numpy
-
-كل حاجة جوه نافذة اللعبة نفسها (من غير ما تكتب في الـ Console):
-  H = إنشاء غرفة (Host)      J = الانضمام لغرفة (Join)      Q / ESC = خروج
-في الـ Host: SPACE لبدء الجولة للاثنين.
-"""
-
-import json
-import math
-import os
-import socket
-import sys
-import threading
-import time
-from collections import Counter, deque
-
-import cv2
-import numpy as np
-
-try:
-    import mediapipe as mp
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-except Exception as e:  # noqa
-    sys.exit(f"MediaPipe غير متاح ({e}).\nجرّب: pip install mediapipe")
-
-# ==========================================
-# الهوية والألوان (BGR)
-# ==========================================
-PLAYER_NAME = "EL BRENS"
-PORT = 5555
-WIN = f"{PLAYER_NAME} - Online RPS"
-W, H = 1280, 720
-FONT = cv2.FONT_HERSHEY_DUPLEX
-FONT_S = cv2.FONT_HERSHEY_SIMPLEX
-
-COLOR_BG_DARK = (32, 14, 28)
-COLOR_BG_LIGHT = (70, 28, 60)
-COLOR_PRIMARY = (255, 140, 40)
-COLOR_SECONDARY = (90, 30, 220)
-COLOR_ACCENT = (220, 80, 170)
-COLOR_GREEN = (110, 230, 80)
-COLOR_TEXT = (245, 245, 250)
-COLOR_MUTED = (170, 150, 165)
-
-IP_FILE = os.path.join(os.path.expanduser("~"), ".elbrens_rps_ip")
-
-
-# ==========================================
-# أدوات الرسم
-# ==========================================
-def put_text(img, text, x, y, scale=0.8, color=COLOR_TEXT, thick=2,
-             font=FONT_S, align="left", shadow=True):
-    (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
-    if align == "center":
-        x -= tw // 2
-    elif align == "right":
-        x -= tw
-    if shadow:
-        cv2.putText(img, text, (x + 2, y + 2), font, scale, (0, 0, 0), thick + 1, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), font, scale, color, thick, cv2.LINE_AA)
-
-
-def rrect(img, p1, p2, color, r=16, th=-1):
-    """مستطيل بحواف دائرية (th=-1 للتعبئة)."""
-    x1, y1 = p1
-    x2, y2 = p2
-    r = max(1, min(r, (x2 - x1) // 2, (y2 - y1) // 2))
-    if th < 0:
-        cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
-        cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
-        for cx, cy in ((x1 + r, y1 + r), (x2 - r, y1 + r), (x1 + r, y2 - r), (x2 - r, y2 - r)):
-            cv2.circle(img, (cx, cy), r, color, -1, cv2.LINE_AA)
-    else:
-        cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, th, cv2.LINE_AA)
-        cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, th, cv2.LINE_AA)
-        cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, th, cv2.LINE_AA)
-        cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, th, cv2.LINE_AA)
-        cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 0, 180, 270, color, th, cv2.LINE_AA)
-        cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 0, 270, 360, color, th, cv2.LINE_AA)
-        cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, color, th, cv2.LINE_AA)
-        cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 0, 90, 180, color, th, cv2.LINE_AA)
-
-
-def panel(img, p1, p2, fill=COLOR_BG_DARK, alpha=0.82, border=None, r=18, th=2):
-    """لوحة شفافة بحواف دائرية."""
-    x1, y1 = max(0, p1[0]), max(0, p1[1])
-    x2, y2 = min(img.shape[1], p2[0]), min(img.shape[0], p2[1])
-    if x2 - x1 < 4 or y2 - y1 < 4:
-        return
-    roi = img[y1:y2, x1:x2]
-    mask = np.zeros(roi.shape[:2], np.uint8)
-    rrect(mask, (0, 0), (x2 - x1 - 1, y2 - y1 - 1), 255, r, -1)
-    blended = cv2.addWeighted(roi, 1 - alpha, np.full_like(roi, fill), alpha, 0)
-    roi[mask > 0] = blended[mask > 0]
-    if border is not None:
-        rrect(img, (x1, y1), (x2 - 1, y2 - 1), border, r, th)
-
-
-def make_bg():
-    """خلفية متدرجة للّوبي."""
-    t = np.linspace(0, 1, H, dtype=np.float32)[:, None, None]
-    a = np.array(COLOR_BG_DARK, np.float32)
-    b = np.array(COLOR_BG_LIGHT, np.float32)
-    col = a * (1 - t) + b * t
-    return np.repeat(col, W, axis=1).astype(np.uint8)
-
-
-def draw_gesture_icon(img, gesture, cx, cy, color):
-    if gesture == "Rock":
-        cv2.circle(img, (cx, cy), 34, color, -1, cv2.LINE_AA)
-        for dx in (-12, 0, 12):
-            cv2.line(img, (cx + dx, cy - 14), (cx + dx, cy + 6), COLOR_BG_DARK, 3, cv2.LINE_AA)
-    elif gesture == "Paper":
-        cv2.rectangle(img, (cx - 22, cy - 5), (cx + 22, cy + 30), color, -1, cv2.LINE_AA)
-        for i, off in enumerate((-16, -6, 5, 16)):
-            hf = 34 if i in (1, 2) else 26
-            cv2.line(img, (cx + off, cy - 5), (cx + off, cy - hf), color, 7, cv2.LINE_AA)
-        cv2.line(img, (cx - 22, cy + 12), (cx - 35, cy - 2), color, 7, cv2.LINE_AA)
-    elif gesture == "Scissors":
-        cv2.circle(img, (cx - 14, cy + 22), 11, color, 4, cv2.LINE_AA)
-        cv2.circle(img, (cx + 14, cy + 22), 11, color, 4, cv2.LINE_AA)
-        cv2.line(img, (cx - 8, cy + 13), (cx + 18, cy - 30), color, 5, cv2.LINE_AA)
-        cv2.line(img, (cx + 8, cy + 13), (cx - 18, cy - 30), color, 5, cv2.LINE_AA)
-
-
-# ==========================================
-# التعرف على اليد
-# ==========================================
-def _dist(a, b):
-    return math.hypot(a.x - b.x, a.y - b.y)
-
-
-def get_hand_gesture(hand_lms):
-    """يعتمد على بُعد رأس الإصبع عن الرسغ (يشتغل مع أي اتجاه لليد)."""
-    lm = hand_lms.landmark
-    wrist = lm[0]
-
-    def up(tip, pip):
-        return _dist(lm[tip], wrist) > _dist(lm[pip], wrist) * 1.08
-
-    index, middle, ring, pinky = up(8, 6), up(12, 10), up(16, 14), up(20, 18)
-
-    if not (index or middle or ring or pinky):
-        return "Rock"
-    if index and middle and ring and pinky:
-        return "Paper"
-    if index and middle and not ring and not pinky:
-        return "Scissors"
-    return "Unknown"
-
-
-def get_winner(mine, opp):
-    if mine == opp:
-        return "DRAW!", "Same move! Try again", COLOR_PRIMARY
-    wins = {("Rock", "Scissors"), ("Paper", "Rock"), ("Scissors", "Paper")}
-    if (mine, opp) in wins:
-        return "YOU WIN!", f"{mine} beats {opp}", COLOR_GREEN
-    return "YOU LOSE!", f"{opp} beats {mine}", COLOR_SECONDARY
-
-
-# ==========================================
-# الشبكة
-# ==========================================
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-class Net:
-    def __init__(self, sock):
-        sock.settimeout(None)
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
-        self.sock = sock
-        self.lock = threading.Lock()
-        self.alive = True
-        self.opp_live = "Unknown"
-        self.opp_locked = None
-        self.start_flag = False
-        threading.Thread(target=self._recv, daemon=True).start()
-
-    def send(self, payload):
-        if not self.alive:
-            return
-        try:
-            self.sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        except OSError:
-            self.alive = False
-
-    def _recv(self):
-        buf = ""
-        while self.alive:
-            try:
-                data = self.sock.recv(4096)
-                if not data:
-                    break
-                buf += data.decode("utf-8", errors="ignore")
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except ValueError:
-                        continue
-                    with self.lock:
-                        if "live" in msg:
-                            self.opp_live = msg["live"]
-                        if "locked" in msg:
-                            self.opp_locked = msg["locked"]
-                        if msg.get("start"):
-                            self.start_flag = True
-                            self.opp_locked = None
-            except OSError:
-                break
-        self.alive = False
-
-    def close(self):
-        self.alive = False
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-
-# ==========================================
-# اللوبي (داخل النافذة)
-# ==========================================
-def load_ip():
-    try:
-        with open(IP_FILE, encoding="utf-8") as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def save_ip(ip):
-    try:
-        with open(IP_FILE, "w", encoding="utf-8") as f:
-            f.write(ip)
-    except OSError:
-        pass
-
-
-def run_lobby():
-    bg = make_bg()
-    cx = W // 2
-    mode = "menu"
-    ip_text = load_ip()
-    error = ""
-    holder = {"sock": None, "err": None, "done": False}
-    server = None
-    my_ip = get_local_ip()
-    t0 = time.time()
-
-    def host_worker(srv, hld):
-        try:
-            conn, _ = srv.accept()
-            hld["sock"] = conn
-        except OSError as e:
-            hld["err"] = str(e)
-        hld["done"] = True
-
-    def join_worker(ip, hld):
-        try:
-            hld["sock"] = socket.create_connection((ip, PORT), timeout=6)
-        except OSError as e:
-            hld["err"] = str(e)
-        hld["done"] = True
-
-    def cancel_host():
-        nonlocal server
-        if server:
-            try:
-                server.close()
-            except OSError:
-                pass
-            server = None
-
-    while True:
-        f = bg.copy()
-        pulse = 0.5 + 0.5 * math.sin((time.time() - t0) * 3)
-
-        put_text(f, PLAYER_NAME, cx, 170, 2.6, COLOR_PRIMARY, 5, FONT, "center")
-        put_text(f, "ONLINE  ROCK  PAPER  SCISSORS", cx, 225, 0.95, COLOR_ACCENT, 2, FONT, "center")
-        cv2.line(f, (cx - 260, 250), (cx + 260, 250), COLOR_ACCENT, 2, cv2.LINE_AA)
-
-        if mode == "menu":
-            panel(f, (cx - 330, 300), (cx + 330, 560), border=COLOR_PRIMARY)
-            put_text(f, "[H]   Host a Game", cx, 375, 1.0, COLOR_GREEN, 2, FONT, "center")
-            put_text(f, "Create a room and wait for your friend", cx, 410, 0.6, COLOR_MUTED, 1, FONT_S, "center")
-            put_text(f, "[J]   Join a Game", cx, 480, 1.0, COLOR_PRIMARY, 2, FONT, "center")
-            put_text(f, "Enter your friend's IP address", cx, 515, 0.6, COLOR_MUTED, 1, FONT_S, "center")
-            if error:
-                put_text(f, error, cx, 610, 0.65, COLOR_SECONDARY, 2, FONT_S, "center")
-
-        elif mode == "host":
-            panel(f, (cx - 360, 300), (cx + 360, 560), border=COLOR_GREEN)
-            put_text(f, "ROOM CREATED", cx, 360, 0.9, COLOR_GREEN, 2, FONT, "center")
-            put_text(f, "Give this IP to your friend:", cx, 410, 0.7, COLOR_TEXT, 1, FONT_S, "center")
-            put_text(f, f"{my_ip}", cx, 480, 1.6, COLOR_PRIMARY, 3, FONT, "center")
-            col = tuple(int(c * (0.55 + 0.45 * pulse)) for c in COLOR_ACCENT)
-            put_text(f, f"Waiting for friend...  (port {PORT})", cx, 535, 0.65, col, 2, FONT_S, "center")
-            put_text(f, "ESC = back", cx, 650, 0.6, COLOR_MUTED, 1, FONT_S, "center")
-            if holder["done"]:
-                if holder["sock"]:
-                    cancel_host()
-                    return holder["sock"], True
-                mode, error = "menu", "Host error: " + str(holder["err"])
-                cancel_host()
-
-        elif mode == "join_input":
-            panel(f, (cx - 360, 300), (cx + 360, 560), border=COLOR_PRIMARY)
-            put_text(f, "ENTER HOST IP", cx, 360, 0.9, COLOR_PRIMARY, 2, FONT, "center")
-            panel(f, (cx - 250, 395), (cx + 250, 465), fill=(10, 5, 12), alpha=0.9, border=COLOR_ACCENT, r=12)
-            cursor = "_" if pulse > 0.5 else " "
-            put_text(f, ip_text + cursor, cx, 445, 1.1, COLOR_TEXT, 2, FONT, "center")
-            put_text(f, "ENTER = connect      ESC = back", cx, 520, 0.6, COLOR_MUTED, 1, FONT_S, "center")
-            if error:
-                put_text(f, error, cx, 610, 0.65, COLOR_SECONDARY, 2, FONT_S, "center")
-
-        elif mode == "joining":
-            panel(f, (cx - 360, 340), (cx + 360, 520), border=COLOR_ACCENT)
-            dots = "." * (int((time.time() - t0) * 3) % 4)
-            put_text(f, f"Connecting to {ip_text}{dots}", cx, 440, 0.9, COLOR_TEXT, 2, FONT, "center")
-            if holder["done"]:
-                if holder["sock"]:
-                    save_ip(ip_text)
-                    return holder["sock"], False
-                mode, error = "join_input", "Could not connect: " + str(holder["err"])[:60]
-
-        cv2.imshow(WIN, f)
-        k = cv2.waitKey(30) & 0xFF
-        try:
-            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
-                cancel_host()
-                return None
-        except cv2.error:
-            pass
-
-        if k == 255:
-            continue
-        if mode == "menu":
-            if k in (ord("q"), 27):
-                return None
-            if k in (ord("h"), ord("H")):
-                try:
-                    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    server.bind(("0.0.0.0", PORT))
-                    server.listen(1)
-                except OSError as e:
-                    error = f"Cannot open port {PORT}: {e}"
-                    cancel_host()
-                    continue
-                holder = {"sock": None, "err": None, "done": False}
-                threading.Thread(target=host_worker, args=(server, holder), daemon=True).start()
-                error, mode = "", "host"
-            elif k in (ord("j"), ord("J")):
-                error, mode = "", "join_input"
-        elif mode == "host":
-            if k == 27:
-                cancel_host()
-                mode = "menu"
-        elif mode == "join_input":
-            if k == 27:
-                mode, error = "menu", ""
-            elif k in (8, 127):
-                ip_text = ip_text[:-1]
-            elif k in (13, 10):
-                if ip_text.strip():
-                    ip_text = ip_text.strip()
-                    holder = {"sock": None, "err": None, "done": False}
-                    threading.Thread(target=join_worker, args=(ip_text, holder), daemon=True).start()
-                    error, mode = "", "joining"
-            elif (48 <= k <= 57 or k == 46) and len(ip_text) < 21:
-                ip_text += chr(k)
-        elif mode == "joining":
-            if k == 27:
-                mode = "join_input"
-
-
-# ==========================================
-# اللعبة
-# ==========================================
-def open_camera():
-    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-    for idx in (0, 1, 2):
-        cap = cv2.VideoCapture(idx, backend)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-            return cap
-        cap.release()
-    return None
-
-
-def draw_hud(frame, my_score, opp_score, round_no, is_host):
-    mid = W // 2
-    panel(frame, (0, 0), (W, 92), alpha=0.88, r=1)
-    cv2.line(frame, (0, 92), (W, 92), COLOR_ACCENT, 2, cv2.LINE_AA)
-
-    panel(frame, (20, 12), (230, 80), fill=(40, 60, 30), alpha=0.9, border=COLOR_GREEN, r=14)
-    put_text(frame, "YOU", 40, 38, 0.6, COLOR_GREEN, 2)
-    put_text(frame, str(my_score), 205, 68, 1.4, COLOR_TEXT, 2, FONT, "right")
-
-    panel(frame, (W - 230, 12), (W - 20, 80), fill=(40, 20, 60), alpha=0.9, border=COLOR_SECONDARY, r=14)
-    put_text(frame, "FRIEND", W - 210, 38, 0.6, (140, 100, 255), 2)
-    put_text(frame, str(opp_score), W - 45, 68, 1.4, COLOR_TEXT, 2, FONT, "right")
-
-    put_text(frame, PLAYER_NAME, mid, 48, 1.1, COLOR_PRIMARY, 2, FONT, "center")
-    put_text(frame, f"ROUND {round_no}   |   {'HOST' if is_host else 'GUEST'}", mid, 78, 0.55,
-             COLOR_MUTED, 1, FONT_S, "center")
-
-
-def draw_footer(frame, my_gesture, opp_live, alive):
-    mid = W // 2
-    panel(frame, (0, H - 56), (W, H), alpha=0.88, r=1)
-    cv2.line(frame, (0, H - 56), (W, H - 56), COLOR_ACCENT, 1, cv2.LINE_AA)
-    dot = COLOR_GREEN if my_gesture != "Unknown" else COLOR_MUTED
-    cv2.circle(frame, (36, H - 28), 7, dot, -1, cv2.LINE_AA)
-    put_text(frame, f"Your hand: {my_gesture}", 54, H - 20, 0.65, COLOR_PRIMARY, 2)
-    cv2.circle(frame, (mid - 150, H - 28), 7, COLOR_GREEN if alive else COLOR_SECONDARY, -1, cv2.LINE_AA)
-    put_text(frame, f"Friend: {opp_live if alive else 'Disconnected'}", mid - 132, H - 20, 0.65,
-             COLOR_GREEN if alive else COLOR_SECONDARY, 2)
-    put_text(frame, "Quit [Q]", W - 30, H - 20, 0.65, COLOR_ACCENT, 2, FONT_S, "right")
-
-
-def play(sock, is_host):
-    net = Net(sock)
-    cap = open_camera()
-    if cap is None:
-        net.close()
-        print("لم يتم العثور على كاميرا.")
-        return
-
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.6,
-    )
-
-    mid = W // 2
-    my_score = opp_score = 0
-    round_no = 1
-    state = "WAITING"          # WAITING -> COUNTDOWN -> SYNCING -> RESULT
-    state_t = time.time()
-    history = deque(maxlen=6)
-    last_valid = "Rock"
-    my_locked = "Rock"
-    opp_final = "Rock"
-    res_title, res_sub, res_color = "", "", COLOR_TEXT
-    last_sent = 0.0
-    notice, notice_t = "", 0.0
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame = cv2.flip(frame, 1)
-        if frame.shape[1] != W or frame.shape[0] != H:
-            frame = cv2.resize(frame, (W, H))
-        now = time.time()
-
-        if not net.alive:
-            panel(frame, (mid - 330, H // 2 - 70), (mid + 330, H // 2 + 70), border=COLOR_SECONDARY)
-            put_text(frame, "FRIEND DISCONNECTED", mid, H // 2 + 12, 1.1, COLOR_SECONDARY, 3, FONT, "center")
-            cv2.imshow(WIN, frame)
-            cv2.waitKey(2000)
-            break
-
-        # ---- تتبع اليد ----
-        res = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        raw = "Unknown"
-        if res.multi_hand_landmarks:
-            lms = res.multi_hand_landmarks[0]
-            mp_drawing.draw_landmarks(
-                frame, lms, mp_hands.HAND_CONNECTIONS,
-                mp_drawing.DrawingSpec(color=COLOR_PRIMARY, thickness=3, circle_radius=4),
-                mp_drawing.DrawingSpec(color=COLOR_ACCENT, thickness=2),
-            )
-            raw = get_hand_gesture(lms)
-        history.append(raw)
-        known = [g for g in history if g != "Unknown"]
-        my_gesture = Counter(known).most_common(1)[0][0] if len(known) >= 3 else "Unknown"
-        if my_gesture != "Unknown":
-            last_valid = my_gesture
-
-        if now - last_sent > 0.1:
-            net.send({"live": my_gesture})
-            last_sent = now
-
-        with net.lock:
-            opp_live = net.opp_live
-
-        draw_hud(frame, my_score, opp_score, round_no, is_host)
-
-        # ---- مراحل الجولة ----
-        if state == "WAITING":
-            bw, bh = 640, 150
-            bx, by = mid - bw // 2, H // 2 - bh // 2
-            panel(frame, (bx, by), (bx + bw, by + bh), border=COLOR_PRIMARY)
-            ready = opp_live != "Unknown"
-            put_text(frame, "Friend is READY!" if ready else "Waiting for friend's hand...",
-                     mid, by + 55, 0.85, COLOR_GREEN if ready else COLOR_ACCENT, 2, FONT_S, "center")
-            put_text(frame, "Press SPACE to start the round" if is_host else "Waiting for Host to press SPACE...",
-                     mid, by + 108, 0.75, COLOR_TEXT, 2, FONT_S, "center")
-            if notice and now - notice_t < 3:
-                put_text(frame, notice, mid, by + bh + 40, 0.65, COLOR_SECONDARY, 2, FONT_S, "center")
-
-            with net.lock:
-                started = net.start_flag
-                net.start_flag = False
-            if started:
-                state, state_t = "COUNTDOWN", now
-
-        elif state == "COUNTDOWN":
-            elapsed = now - state_t
-            count = 3 - int(elapsed)
-            if count > 0:
-                frac = elapsed - int(elapsed)
-                cy = H // 2 - 10
-                put_text(frame, "SHOW YOUR MOVE", mid, cy - 125, 0.9, COLOR_ACCENT, 2, FONT, "center")
-                cv2.circle(frame, (mid, cy), 90, COLOR_BG_DARK, -1, cv2.LINE_AA)
-                cv2.circle(frame, (mid, cy), 90, COLOR_BG_LIGHT, 6, cv2.LINE_AA)
-                cv2.ellipse(frame, (mid, cy), (90, 90), -90, 0, 360 * frac, COLOR_PRIMARY, 6, cv2.LINE_AA)
-                put_text(frame, str(count), mid, cy + 40, 3.2, COLOR_PRIMARY, 6, FONT, "center")
-            else:
-                my_locked = last_valid
-                net.send({"locked": my_locked})
-                state, state_t = "SYNCING", now
-
-        elif state == "SYNCING":
-            put_text(frame, "Revealing...", mid, H // 2, 1.2, COLOR_PRIMARY, 3, FONT, "center")
-            with net.lock:
-                got = net.opp_locked
-                if got is not None:
-                    net.opp_locked = None
-            if got is not None:
-                opp_final = got
-                res_title, res_sub, res_color = get_winner(my_locked, opp_final)
-                if "WIN" in res_title:
-                    my_score += 1
-                elif "LOSE" in res_title:
-                    opp_score += 1
-                state, state_t = "RESULT", now
-            elif now - state_t > 6:
-                notice, notice_t = "Round timed out - try again", now
-                state, state_t = "WAITING", now
-
-        elif state == "RESULT":
-            elapsed = now - state_t
-            cy = H // 2
-            if elapsed < 1.0:
-                cv2.rectangle(frame, (4, 96), (W - 4, H - 60), res_color, 6, cv2.LINE_AA)
-
-            panel(frame, (mid - 330, cy - 130), (mid - 100, cy + 100), border=COLOR_GREEN, th=3)
-            put_text(frame, "YOU", mid - 215, cy - 92, 0.7, COLOR_GREEN, 2, FONT_S, "center")
-            draw_gesture_icon(frame, my_locked, mid - 215, cy - 15, COLOR_GREEN)
-            put_text(frame, my_locked, mid - 215, cy + 78, 0.8, COLOR_TEXT, 2, FONT_S, "center")
-
-            put_text(frame, "VS", mid, cy + 10, 1.4, COLOR_PRIMARY, 3, FONT, "center")
-
-            panel(frame, (mid + 100, cy - 130), (mid + 330, cy + 100), border=COLOR_SECONDARY, th=3)
-            put_text(frame, "FRIEND", mid + 215, cy - 92, 0.7, (140, 100, 255), 2, FONT_S, "center")
-            draw_gesture_icon(frame, opp_final, mid + 215, cy - 15, (140, 100, 255))
-            put_text(frame, opp_final, mid + 215, cy + 78, 0.8, COLOR_TEXT, 2, FONT_S, "center")
-
-            panel(frame, (mid - 240, cy + 125), (mid + 240, cy + 215), alpha=0.92, border=res_color, th=3)
-            put_text(frame, res_title, mid, cy + 175, 1.3, res_color, 3, FONT, "center")
-            put_text(frame, res_sub, mid, cy + 203, 0.6, COLOR_TEXT, 1, FONT_S, "center")
-
-            if elapsed > 3.5:
-                round_no += 1
-                state, state_t = "WAITING", now
-
-        draw_footer(frame, my_gesture, opp_live, net.alive)
-        cv2.imshow(WIN, frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), ord("Q"), 27):
-            break
-        if key == 32 and is_host and state == "WAITING":
-            net.send({"start": True})
-            with net.lock:
-                net.opp_locked = None
-            state, state_t = "COUNTDOWN", time.time()
-        try:
-            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
-                break
-        except cv2.error:
-            pass
-
-    cap.release()
-    hands.close()
-    net.close()
-
-
-def main():
-    cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
-    result = run_lobby()
-    if result:
-        sock, is_host = result
-        play(sock, is_host)
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0f071e">
+<meta name="description" content="Lectures and sections schedule - Cyber-Security - Second Year - Helwan International Technological University">
+<title>El Brens Cyber - Second Year Schedule 2026/2027</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+:root{
+  --bg-dark:#0f071e; --bg-card:#180c2e;
+  --purple:#8a2be2; --purple-light:#9d4edd;
+  --blue:#48cae4; --blue-glow:rgba(72,202,228,.4);
+  --text:#f8f9fa; --muted:#b1a7d8; --pink:#f72585;
+  --border:rgba(138,43,226,.3);
+  --lecture:#ff4d4d; --section:#2ecc71;
+}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Cairo',sans-serif}
+body{
+  background:var(--bg-dark);color:var(--text);min-height:100vh;overflow-x:hidden;
+  background-image:radial-gradient(circle at 10% 20%,rgba(138,43,226,.15),transparent 40%),
+                   radial-gradient(circle at 90% 80%,rgba(72,202,228,.15),transparent 40%);
+  background-attachment:fixed;
+}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+
+header{
+  background:linear-gradient(135deg,#180c2e,#241147);
+  border-bottom:2px solid var(--purple);padding:20px 15px;text-align:center;
+  box-shadow:0 10px 30px rgba(0,0,0,.5);
+}
+.header-row{flex-direction:row-reverse;display:flex;align-items:center;justify-content:space-between;gap:12px;max-width:900px;margin:0 auto}
+.header-content{flex:1;display:flex;flex-direction:column;align-items:center;gap:10px;min-width:0}
+.side-logo{flex:0 0 auto;width:84px;height:84px;border-radius:50%;background:#fff;padding:4px;object-fit:contain;
+  border:2px solid var(--blue);box-shadow:0 0 18px var(--blue-glow),0 4px 14px rgba(0,0,0,.5);transition:transform .3s}
+.side-logo:hover{transform:scale(1.08) rotate(-3deg)}
+.brand{font-family:'Orbitron','Cairo',sans-serif;font-weight:900;font-size:2rem;letter-spacing:4px;direction:ltr;line-height:1.1;
+  background:linear-gradient(90deg,#f72585,#b5179e,#8a2be2,#48cae4,#4ade80,#f72585);background-size:300% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  animation:shine 6s linear infinite;filter:drop-shadow(0 0 10px rgba(138,43,226,.7))}
+@keyframes shine{to{background-position:300% 0}}
+.logo{position:relative;width:88px;height:88px;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(circle at 50% 45%,#1b1147 0%,#0b0620 75%);border-radius:50%;overflow:visible;
+  box-shadow:0 0 30px var(--blue-glow),inset 0 0 18px rgba(72,202,228,.35);animation:pulse 4s infinite alternate}
+.logo svg{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);animation:atomspin 14s linear infinite,hue 7s linear infinite;filter:drop-shadow(0 0 3px rgba(72,202,228,.8))}
+@keyframes atomspin{to{transform:rotate(360deg)}}
+@keyframes hue{to{filter:drop-shadow(0 0 3px rgba(72,202,228,.8)) hue-rotate(360deg)}}
+.logo-ring{position:absolute;width:104px;height:104px;border:2px dashed var(--blue);border-radius:50%;animation:spin 8s linear infinite}
+.logo-text{font-family:'Orbitron','Cairo',sans-serif;font-size:1.55rem;font-weight:900;z-index:2;letter-spacing:1px;
+  background:linear-gradient(90deg,#f72585,#ffd60a,#4ade80,#48cae4,#b388ff,#f72585);background-size:300% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shine 3s linear infinite;
+  filter:drop-shadow(0 0 4px rgba(0,0,0,.95)) drop-shadow(0 0 6px rgba(255,255,255,.35))}
+@keyframes pulse{from{transform:scale(1);filter:hue-rotate(0)}to{transform:scale(1.06);filter:hue-rotate(35deg)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:1.3rem;font-weight:700;background:linear-gradient(90deg,#fff,var(--blue));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.subtitle{font-size:.9rem;color:var(--muted)}
+.print-sec{display:none}
+.saved{font-size:.78rem;color:#4ade80;min-height:1.1em}
+
+.actions-bar{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin:15px auto;max-width:900px;padding:0 15px}
+.btn{background:linear-gradient(135deg,var(--purple),var(--purple-light));color:#fff;border:none;padding:10px 18px;border-radius:12px;
+  font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;box-shadow:0 4px 15px rgba(138,43,226,.4);
+  transition:transform .25s,box-shadow .25s,filter .25s;text-decoration:none;font-size:.9rem}
+.btn:hover{transform:translateY(-3px);box-shadow:0 6px 20px var(--blue-glow);filter:brightness(1.1)}
+.btn-wa{background:linear-gradient(135deg,#25d366,#128c7e);box-shadow:0 4px 15px rgba(37,211,102,.4)}
+.btn-portal{background:linear-gradient(135deg,#48cae4,#0077b6);box-shadow:0 4px 15px rgba(72,202,228,.4)}
+.btn-pdf{background:linear-gradient(135deg,#ff6b6b,#d62839);box-shadow:0 4px 15px rgba(214,40,57,.4)}
+.btn-sm{font-size:.78rem;padding:6px 10px;border-radius:8px;box-shadow:none}
+.btn-platform{background:linear-gradient(135deg,#f72585,#b5179e)}
+.btn-cal{background:linear-gradient(135deg,#4285F4,#34A853)}
+
+.panel{max-width:950px;margin:15px auto;padding:15px;background:rgba(24,12,46,.85);border-radius:16px;
+  border:1px solid var(--border);display:flex;flex-direction:column;gap:12px;width:calc(100% - 30px)}
+.panel h2{font-size:.9rem;color:var(--muted);font-weight:600}
+.panel h2 i{color:var(--blue)}
+.chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:8px}
+.chip{background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:9px 0;border-radius:10px;
+  font-size:.95rem;font-weight:700;cursor:pointer;transition:.2s;text-align:center}
+.chip:hover{border-color:var(--blue)}
+.chip.active{background:linear-gradient(135deg,var(--purple),var(--purple-light));border-color:var(--blue);box-shadow:0 0 12px var(--blue-glow)}
+.chip.all{grid-column:span 2;font-size:.85rem}
+.search{position:relative}
+.search input{width:100%;background:rgba(255,255,255,.07);border:1px solid var(--border);padding:12px 45px 12px 40px;
+  border-radius:12px;color:#fff;font-size:.95rem;outline:none;transition:.3s}
+.search input:focus{border-color:var(--blue);box-shadow:0 0 15px var(--blue-glow)}
+.search i.s{position:absolute;right:15px;top:50%;transform:translateY(-50%);color:var(--blue)}
+.search button{position:absolute;left:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);cursor:pointer;font-size:1rem;display:none}
+.search.has-text button{display:block}
+.filters{display:flex;flex-wrap:wrap;gap:12px}
+.field{flex:1;min-width:200px;display:flex;flex-direction:column;gap:5px}
+.field label{font-size:.85rem;color:var(--muted);font-weight:600}
+.field select{background:var(--bg-card);color:#fff;border:1px solid var(--border);padding:10px;border-radius:10px;font-size:.9rem;cursor:pointer}
+.weeks{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
+.week-btn{background:var(--bg-card);color:var(--muted);border:1px solid var(--border);padding:6px 16px;border-radius:8px;font-size:.85rem;font-weight:600;cursor:pointer;transition:.2s}
+.week-btn.active{background:var(--purple);color:#fff;border-color:var(--blue);box-shadow:0 0 10px var(--blue-glow)}
+.panel-foot{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;font-size:.8rem;color:var(--muted)}
+.link-btn{background:none;border:none;color:var(--blue);cursor:pointer;font-weight:600;font-size:.8rem}
+
+.next{max-width:950px;margin:0 auto 15px;width:calc(100% - 30px);padding:12px 16px;border-radius:14px;
+  background:linear-gradient(90deg,rgba(72,202,228,.18),rgba(138,43,226,.18));border:1px solid var(--blue);
+  display:none;gap:10px;align-items:center;font-size:.92rem}
+.next.show{display:flex}
+.next i{color:var(--blue);font-size:1.2rem}
+
+.container{max-width:950px;margin:0 auto 40px;padding:0 15px}
+.day-card{background:var(--bg-card);border-radius:16px;border:1px solid var(--border);margin-bottom:25px;
+  box-shadow:0 8px 32px rgba(0,0,0,.4);overflow:hidden;animation:fade .4s ease}
+.day-card.today{border-color:var(--blue);box-shadow:0 8px 32px rgba(0,0,0,.4),0 0 18px var(--blue-glow)}
+.day-header{background:linear-gradient(90deg,rgba(138,43,226,.3),rgba(72,202,228,.1));padding:15px 20px;font-size:1.2rem;font-weight:700;
+  color:var(--blue);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.day-header .tags{display:flex;gap:6px}
+.day-header span.tag{font-size:.8rem;background:var(--purple);color:#fff;padding:3px 10px;border-radius:20px}
+.day-header span.tag.now{background:var(--blue);color:#06202a;font-weight:700}
+.list{padding:15px;display:flex;flex-direction:column;gap:12px}
+.item{background:rgba(255,255,255,.03);padding:12px 15px;border-radius:8px;display:flex;flex-direction:column;gap:6px;
+  transition:background .2s;border-inline-start:5px solid var(--lecture)}
+.item.section{border-inline-start-color:var(--section)}
+.item:hover{background:rgba(138,43,226,.1)}
+.item.ongoing{background:rgba(72,202,228,.12);box-shadow:inset 0 0 0 1px var(--blue)}
+.time{font-size:.8rem;color:var(--blue);font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.period{background:rgba(138,43,226,.25);color:#d8b4fe;padding:2px 8px;border-radius:6px;font-size:.75rem;border:1px solid var(--border)}
+.title{font-size:1rem;font-weight:700}
+.details{font-size:.85rem;color:var(--muted);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-top:4px}
+.badges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.badge{padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:600;border:1px solid transparent}
+.b-sec{background:rgba(247,37,133,.2);color:var(--pink);border-color:rgba(247,37,133,.4)}
+.b-w1{background:rgba(247,37,133,.25);color:#ff477e;border-color:rgba(247,37,133,.5);font-weight:700}
+.b-w2{background:rgba(72,202,228,.25);color:var(--blue);border-color:rgba(72,202,228,.5);font-weight:700}
+.b-room{background:rgba(72,202,228,.15);color:var(--blue)}
+.b-lec{background:rgba(255,77,77,.2);color:#ff7b7b;border-color:rgba(255,77,77,.5)}
+.b-lab{background:rgba(46,204,113,.2);color:#4ade80;border-color:rgba(46,204,113,.5)}
+.b-now{background:var(--blue);color:#06202a;font-weight:700}
+.buttons{display:flex;gap:6px;flex-wrap:wrap}
+.day-off,.empty,.prompt{padding:20px;text-align:center;color:var(--muted);font-style:italic}
+.empty,.prompt{display:none;background:var(--bg-card);border:1px dashed var(--border);border-radius:16px}
+.empty.show,.prompt.show{display:block}
+.prompt{font-style:normal;font-size:1.05rem}
+.prompt i{color:var(--blue);font-size:1.6rem;display:block;margin-bottom:8px}
+.legend{display:flex;gap:16px;justify-content:center;font-size:.8rem;color:var(--muted);margin-bottom:15px;flex-wrap:wrap}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-inline-end:6px;vertical-align:middle}
+.modal{position:fixed;inset:0;z-index:100;background:rgba(5,2,15,.94);display:flex;flex-direction:column}
+.modal[hidden]{display:none}
+.modal-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 14px;
+  background:linear-gradient(135deg,#180c2e,#241147);border-bottom:2px solid var(--purple)}
+.modal-bar strong{font-size:.95rem}
+.modal-actions .btn{font-weight:900}
+.modal-actions{display:flex;gap:8px;flex-wrap:wrap}
+.modal-actions .btn,.modal-actions button.btn{padding:7px 12px;font-size:.82rem;border-radius:9px;box-shadow:none}
+.modal-body{flex:1;overflow:auto;padding:10px;touch-action:pan-x pan-y pinch-zoom;-webkit-overflow-scrolling:touch}
+.modal-body img{display:block;margin:0 auto;width:calc(var(--z,100)*1%);max-width:none;background:#fff;border-radius:6px}
+footer{text-align:center;padding:20px;color:var(--muted);font-size:.85rem;border-top:1px solid var(--border);margin-top:30px}
+@keyframes fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:520px){.buttons{width:100%}.btn-sm{flex:1;justify-content:center}.side-logo{width:56px;height:56px}.brand{font-size:1.25rem;letter-spacing:2px}h1{font-size:1.05rem}.subtitle{font-size:.78rem}.logo{width:76px;height:76px}.logo-ring{width:90px;height:90px}}
+@media print{
+  body{background:#fff;color:#000}
+  .modal,header .logo,.brand,.actions-bar,.panel,.next,footer,.btn-sm,.legend,.prompt,.empty{display:none!important}
+  header{background:none;box-shadow:none;border-bottom:1px solid #999}
+  h1{-webkit-text-fill-color:#000;color:#000}.subtitle{color:#333}
+  .print-sec{display:block;font-weight:700;color:#000;font-size:1.1rem}
+  .day-card{border:1px solid #ccc;box-shadow:none;break-inside:avoid;background:#fff;animation:none}
+  .day-header{background:#eee;color:#000}
+  .item{background:#f9f9f9;border-inline-start-color:#333!important}
+  .title{color:#000}.time,.badge,.period,.details{color:#333!important;background:none!important}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-row">
+    <img class="side-logo" src="data:image/jpeg;base64,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
